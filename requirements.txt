@@ -1,0 +1,9 @@
+pandas
+numpy
+scikit-learn
+joblib
+matplotlib
+MetaTrader5
+python-dotenv
+pyzmq
+tabulate
