@@ -8,7 +8,12 @@ from datetime import datetime, timedelta
 
 from src.utils import connect_mt5, disconnect_mt5, get_latest_ticks, place_order, logger
 from src.indicators import add_all_indicators
-from src.pcp_hedge import build_synthetic_hedge, execute_synthetic_hedge, check_parity_for_symbol
+from src.pcp_hedge import (
+    hedge_with_arb_check,
+    execute_synthetic_hedge,
+    scan_arbitrage_opportunities,
+    check_parity_for_symbol,
+)
 import os
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
@@ -18,20 +23,15 @@ SYMBOL_ENCODER_PATH = os.path.join(MODEL_DIR, "symbol_label_encoder.pkl")
 
 
 def _get_nearest_expiry(days_ahead: int = 30) -> str:
-    """
-    Return the nearest standard option expiry (3rd Friday of next month)
-    as a string 'YYYYMMDD'. Falls back to days_ahead if no Friday found.
-    """
-    today = datetime.now()
+    """Return the nearest 3rd-Friday expiry as 'YYYYMMDD'."""
+    today  = datetime.now()
     target = today + timedelta(days=days_ahead)
-
-    # Walk forward to the 3rd Friday of the target month
-    first_of_month = target.replace(day=1)
+    first  = target.replace(day=1)
     fridays = [
-        first_of_month + timedelta(days=d)
+        first + timedelta(days=d)
         for d in range(31)
-        if (first_of_month + timedelta(days=d)).month == target.month
-        and (first_of_month + timedelta(days=d)).weekday() == 4  # Friday
+        if (first + timedelta(days=d)).month == target.month
+        and (first + timedelta(days=d)).weekday() == 4
     ]
     expiry_date = fridays[2] if len(fridays) >= 3 else target
     return expiry_date.strftime("%Y%m%d")
@@ -48,69 +48,94 @@ def run_live(
     password=None,
     server=None,
     path=None,
-    # ── PCP hedge parameters ──────────────────────────────────────────────
-    use_pcp_hedge=True,          # Master switch for hedging
-    hedge_ratio=1.0,             # Fraction of position to hedge (0.0 – 1.0)
-    risk_free_rate=0.05,         # Annual risk-free rate for PV(X) calculation
-    option_days_to_expiry=30,    # Days until option expiry
-    option_expiry=None,          # Override expiry string 'YYYYMMDD'; auto if None
+    # ── PCP parameters ────────────────────────────────────────────────────
+    use_pcp_hedge=True,
+    use_arb_detection=True,
+    auto_execute_arb=False,        # True = fire arb trades automatically
+    hedge_ratio=1.0,
+    risk_free_rate=0.05,
+    option_days_to_expiry=30,
+    option_expiry=None,
+    min_arb_profit=0.0003,         # min net profit to execute an arb signal
+    arb_scan_symbols=None,         # extra symbols to scan for arb (besides trading symbol)
 ):
     """
-    Live trading loop with optional Put-Call Parity synthetic hedge.
+    Live trading loop with:
+      1. Arbitrage detection  — scans for C+PV(X) ≠ P+S violations
+      2. Synthetic hedging    — hedges every spot position via options
+      3. Combined mode        — hedge_with_arb_check() runs both atomically
 
-    After every spot BUY  → opens Synthetic Short (Buy Put + Sell Call)
-    After every spot SELL → opens Synthetic Long  (Buy Call + Sell Put)
-
-    The hedge is sized by hedge_ratio * lots and uses the nearest ATM
-    options for the given underlying on MT5.
+    After every spot BUY  → Synthetic Short (Buy Put + Sell Call)
+    After every spot SELL → Synthetic Long  (Buy Call + Sell Put)
+    If parity is violated at the time of hedging → arb legs are also fired
+    (when auto_execute_arb=True).
 
     Args:
-        use_pcp_hedge:         Enable/disable the hedge entirely
-        hedge_ratio:           1.0 = full hedge, 0.5 = half hedge, etc.
-        risk_free_rate:        Used in PV(X) = X * e^(-rT)
-        option_days_to_expiry: Calendar days to expiry (used for PV calc)
-        option_expiry:         Exact expiry string; auto-computed if None
+        use_arb_detection:  Enable standalone arb scan at startup and each poll cycle
+        auto_execute_arb:   Automatically execute arb trades when executable signal found
+        arb_scan_symbols:   Additional symbols scanned for arb each cycle (e.g. ['GBPUSD'])
+        min_arb_profit:     Minimum net profit for an arb signal to be executable
     """
-    # ── Connect ──────────────────────────────────────────────────────────
     ok = connect_mt5(login=login, password=password, server=server, path=path)
     if not ok:
         raise SystemExit("MT5 connect failed")
 
-    # ── Load model ───────────────────────────────────────────────────────
+    # ── Load model ────────────────────────────────────────────────────────
     model_data = joblib.load(MODEL_PATH)
     if isinstance(model_data, dict):
-        clf = model_data['model']
+        clf           = model_data['model']
         feature_names = model_data.get('feature_names', [])
-        logger.info(
-            f"Loaded model with {len(feature_names)} features, "
-            f"trained on {model_data.get('training_date', 'unknown date')}"
-        )
+        logger.info(f"Model loaded — {len(feature_names)} features, "
+                    f"trained {model_data.get('training_date','unknown')}")
     else:
-        clf = model_data
-        feature_names = []
-        logger.info("Loaded model (old format)")
+        clf, feature_names = model_data, []
 
-    label_enc = joblib.load(LABEL_ENCODER_PATH)
-    symbol_enc = None
-    if os.path.exists(SYMBOL_ENCODER_PATH):
-        symbol_enc = joblib.load(SYMBOL_ENCODER_PATH)
+    label_enc  = joblib.load(LABEL_ENCODER_PATH)
+    symbol_enc = joblib.load(SYMBOL_ENCODER_PATH) if os.path.exists(SYMBOL_ENCODER_PATH) else None
 
-    # ── Resolve option expiry ─────────────────────────────────────────────
+    # ── Resolve expiry ────────────────────────────────────────────────────
     expiry = option_expiry or _get_nearest_expiry(option_days_to_expiry)
+    scan_symbols = list({symbol} | set(arb_scan_symbols or []))
+
     logger.info(
-        f"Starting live loop for {symbol} (lots={lots}) | "
+        f"Live loop starting — symbol={symbol} lots={lots} | "
         f"PCP hedge={'ON' if use_pcp_hedge else 'OFF'} | "
-        f"Expiry={expiry} | HedgeRatio={hedge_ratio}"
+        f"Arb detection={'ON' if use_arb_detection else 'OFF'} | "
+        f"Auto-execute arb={auto_execute_arb} | "
+        f"Expiry={expiry} | Hedge ratio={hedge_ratio}"
     )
 
-    if use_pcp_hedge:
-        # Run a parity check at startup so we know options are reachable
-        logger.info("Running startup parity check...")
+    # ── Startup checks ────────────────────────────────────────────────────
+    if use_arb_detection:
+        logger.info(f"Startup arb scan on: {scan_symbols}")
+        scan_arbitrage_opportunities(
+            symbols=scan_symbols,
+            expiry=expiry,
+            risk_free_rate=risk_free_rate,
+            days_to_expiry=option_days_to_expiry,
+            min_profit_threshold=min_arb_profit,
+            auto_execute=False,     # never auto-execute at startup, observe only
+            lots=lots,
+        )
+    elif use_pcp_hedge:
         check_parity_for_symbol(symbol, expiry, risk_free_rate, option_days_to_expiry)
 
+    # ── Main loop ─────────────────────────────────────────────────────────
     try:
         while True:
-            # ── Fetch market data ─────────────────────────────────────────
+            # Periodic arb scan (independent of whether a trade fires)
+            if use_arb_detection:
+                scan_arbitrage_opportunities(
+                    symbols=scan_symbols,
+                    expiry=expiry,
+                    risk_free_rate=risk_free_rate,
+                    days_to_expiry=option_days_to_expiry,
+                    min_profit_threshold=min_arb_profit,
+                    auto_execute=auto_execute_arb,
+                    lots=lots,
+                )
+
+            # ── Market data + feature engineering ────────────────────────
             df = get_latest_ticks(symbol, n=window)
             if df.empty or len(df) < 10:
                 logger.warning("Not enough data, sleeping")
@@ -121,17 +146,11 @@ def run_live(
             df = add_all_indicators(df)
             latest = df.iloc[-1].copy()
 
-            # ── Build feature vector ──────────────────────────────────────
-            if feature_names:
-                feature_cols = feature_names
-            else:
-                feature_cols = [
-                    'open', 'high', 'low', 'close', 'volume',
-                    'hl_range', 'oc_change', 'return',
-                    'ema_5', 'ema_20', 'sma_5', 'sma_20', 'rsi', 'atr'
-                ]
-                if symbol_enc is not None:
-                    feature_cols.append('symbol_enc')
+            feature_cols = feature_names or (
+                ['open','high','low','close','volume','hl_range','oc_change','return',
+                 'ema_5','ema_20','sma_5','sma_20','rsi','atr']
+                + (['symbol_enc'] if symbol_enc is not None else [])
+            )
 
             if symbol_enc is not None and 'symbol_enc' in feature_cols:
                 try:
@@ -142,7 +161,6 @@ def run_live(
 
             for col in feature_cols:
                 if col not in latest:
-                    logger.warning(f"Missing feature: {col}, setting to 0")
                     latest[col] = 0
 
             X_values = []
@@ -152,118 +170,121 @@ def run_live(
                 except (ValueError, TypeError):
                     X_values.append(0.0)
 
-            X = np.array(X_values).reshape(1, -1)
-            pred = clf.predict(X)[0]
-            signal = label_enc.inverse_transform([pred])[0]
+            X      = np.array(X_values).reshape(1, -1)
+            pred   = clf.predict(X)[0]
+            signal_label = label_enc.inverse_transform([pred])[0]
 
-            logger.info(f"{symbol} close={latest['close']:.5f} predicted => {signal}")
+            logger.info(f"{symbol} close={latest['close']:.5f} → {signal_label}")
 
             # ── Skip if position already open ─────────────────────────────
-            positions = mt5.positions_get(symbol=symbol)
-            if positions:
-                logger.info(f"Already have {len(positions)} open position(s), skipping")
+            if mt5.positions_get(symbol=symbol):
+                logger.info("Position open — skipping new entry")
                 time.sleep(poll_interval)
                 continue
 
-            if signal == 'hold':
-                logger.info("Hold signal - no trade executed")
+            if signal_label == 'hold':
+                logger.info("Hold — no trade")
                 time.sleep(poll_interval)
                 continue
 
-            # ── Get tick / symbol info ────────────────────────────────────
+            # ── Fetch tick / symbol info ──────────────────────────────────
             tick = mt5.symbol_info_tick(symbol)
             if tick is None:
-                logger.warning(f"Could not get tick for {symbol}")
+                logger.warning(f"No tick for {symbol}")
                 time.sleep(poll_interval)
                 continue
 
             symbol_info = mt5.symbol_info(symbol)
             if not symbol_info:
-                logger.error(f"Could not get symbol info for {symbol}")
+                logger.error(f"No symbol info for {symbol}")
                 time.sleep(poll_interval)
                 continue
 
-            digits = symbol_info.digits
+            digits   = symbol_info.digits
             pip_size = 0.0001 if digits == 5 else 0.001
 
             # ── Execute spot order ────────────────────────────────────────
             spot_result = None
 
-            if signal == 'buy':
+            if signal_label == 'buy':
                 price = tick.ask
-                sl = price - sl_pips * pip_size
-                tp = price + tp_pips * pip_size
+                sl, tp = price - sl_pips * pip_size, price + tp_pips * pip_size
                 spot_result = place_order(symbol, 'buy', lots=lots, price=price, sl=sl, tp=tp)
-
                 if spot_result and spot_result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logger.info(
-                        f"BUY executed @ {price:.5f} | SL={sl:.5f} | TP={tp:.5f}"
-                    )
+                    logger.info(f"BUY @ {price:.5f} | SL={sl:.5f} TP={tp:.5f}")
                 else:
-                    logger.warning(
-                        f"BUY failed: {spot_result.retcode if spot_result else 'None'}"
-                    )
+                    logger.warning(f"BUY failed: {spot_result.retcode if spot_result else 'None'}")
 
-            elif signal == 'sell':
+            elif signal_label == 'sell':
                 price = tick.bid
-                sl = price + sl_pips * pip_size
-                tp = price - tp_pips * pip_size
+                sl, tp = price + sl_pips * pip_size, price - tp_pips * pip_size
                 spot_result = place_order(symbol, 'sell', lots=lots, price=price, sl=sl, tp=tp)
-
                 if spot_result and spot_result.retcode == mt5.TRADE_RETCODE_DONE:
-                    logger.info(
-                        f"SELL executed @ {price:.5f} | SL={sl:.5f} | TP={tp:.5f}"
-                    )
+                    logger.info(f"SELL @ {price:.5f} | SL={sl:.5f} TP={tp:.5f}")
                 else:
-                    logger.warning(
-                        f"SELL failed: {spot_result.retcode if spot_result else 'None'}"
-                    )
+                    logger.warning(f"SELL failed: {spot_result.retcode if spot_result else 'None'}")
 
-            # ── Build & execute PCP synthetic hedge ───────────────────────
+            # ── PCP: arbitrage check + synthetic hedge ────────────────────
             if (
                 use_pcp_hedge
                 and spot_result is not None
                 and spot_result.retcode == mt5.TRADE_RETCODE_DONE
             ):
-                logger.info(
-                    f"Building PCP synthetic hedge for {signal.upper()} position..."
-                )
+                logger.info(f"Running hedge_with_arb_check() for {signal_label.upper()} position...")
 
-                hedge = build_synthetic_hedge(
-                    trade_direction=signal,        # 'buy' or 'sell'
+                pcp_result = hedge_with_arb_check(
+                    trade_direction=signal_label,
                     underlying=symbol,
                     expiry=expiry,
                     trade_lots=lots,
                     risk_free_rate=risk_free_rate,
                     days_to_expiry=option_days_to_expiry,
                     hedge_ratio=hedge_ratio,
+                    min_profit_threshold=min_arb_profit,
+                    auto_execute_arb=auto_execute_arb,
                 )
 
-                if hedge is not None:
-                    hedge_results = execute_synthetic_hedge(hedge, lots=hedge.hedge_ratio)
+                arb    = pcp_result["arb_signal"]
+                hedge  = pcp_result["hedge"]
 
-                    if hedge_results["success"]:
+                # Log arbitrage outcome
+                if arb is not None:
+                    if arb.is_executable and auto_execute_arb:
                         logger.info(
-                            f"Hedge complete: {hedge.direction.upper()} | "
-                            f"Net cost = {hedge.net_cost:+.5f} | "
-                            f"C+PV(X) = {hedge.parity.lhs:.5f} | "
-                            f"P+S = {hedge.parity.rhs:.5f}"
+                            f"[ARB] Executed — direction={arb.direction} "
+                            f"net_profit={arb.net_profit:.5f}"
+                        )
+                    elif arb.is_executable:
+                        logger.warning(
+                            f"[ARB] Executable opportunity found but auto_execute_arb=False. "
+                            f"net={arb.net_profit:.5f} | Pass --auto-execute-arb to enable."
                         )
                     else:
-                        logger.warning(
-                            "Hedge execution partially failed — spot position is unhedged. "
-                            "Check logs for details."
+                        logger.info(
+                            f"[ARB] Violation detected but below profit threshold "
+                            f"(net={arb.net_profit:.5f})"
                         )
+
+                # Execute hedge
+                if hedge is not None:
+                    hedge_result = execute_synthetic_hedge(hedge, lots=hedge.hedge_ratio)
+                    if hedge_result["success"]:
+                        logger.info(
+                            f"[HEDGE] {hedge.direction.upper()} complete | "
+                            f"net_cost={hedge.net_cost:+.5f}"
+                        )
+                    else:
+                        logger.warning("[HEDGE] Partial failure — review open option legs")
                 else:
                     logger.warning(
-                        "Options unavailable — spot position is running WITHOUT a hedge. "
-                        "Verify option symbols on your broker/MT5 terminal."
+                        "[HEDGE] Options unavailable — spot running WITHOUT hedge. "
+                        "Verify option symbols for your broker."
                     )
 
             time.sleep(poll_interval)
 
     except KeyboardInterrupt:
-        logger.info("Stopping live loop via KeyboardInterrupt")
+        logger.info("Stopped via KeyboardInterrupt")
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         import traceback
